@@ -1,0 +1,506 @@
+# Imports
+
+import pandas as pd
+import xarray as xr
+from tqdm import tqdm
+import numpy as np
+
+# Includes
+
+include: "workflow/library.smk"
+#TODO delete (this file is empty):
+#include: "workflow/local.smk"
+
+
+# Load config
+configfile: "config.yaml"
+
+
+# Containers and environments
+container: config["container"]["default"]
+
+
+# Load project-config
+config["species_to_genomes"] = (
+    pd.read_table("meta/genome.tsv").astype(str).groupby("species").genome.apply(list)
+)
+config["species_to_reference_genome"] = (
+    pd.read_table("meta/species_to_reference_genome.tsv")
+    .astype(str)
+    .set_index("species_id")
+    .genome_id
+)
+
+# Wildcard constraints
+
+# TODO
+
+# Setup rules
+rule configure_git:
+    shell:
+        """
+        git config --local filter.dropoutput_ipynb.clean scripts/ipynb_output_filter.py
+        git config --local filter.dropoutput_ipynb.smudge cat
+        git config --local alias.l "log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr)' --abbrev-commit"
+        git config --local alias.wdiff "diff --color-words"
+        git config --local alias.diffc "diff --cached"
+        git config --local alias.s "status -uno"
+        git config --local alias.ls-other "ls-files --other --exclude-standard"
+        git config --local alias.grep-other "!git ls-other | git grep -f -"
+        git config --local alias.grep-hist '!f() {{ patt=$1; shift; git grep $patt $(git rev-list --all) $@; }}; f'
+        git config --local pull.ff only
+        """
+
+
+# Utility rules
+rule start_ipython:
+    conda:
+        "conda/toolz.yaml"
+    shell:
+        "ipython"
+
+rule start_shell:
+    shell:
+        "bash"
+
+rule start_ipython_pynufft:
+    conda:
+        "conda/pynufft.yaml"
+    shell:
+        "ipython"
+
+rule start_shell_any_conda:
+    output:
+        "start_shell.{conda}",
+    conda:
+        lambda w: f"conda/{w.conda}.yaml"
+    shell:
+        "bash; echo 'Rule always fails due to MissingOutputException.'"
+
+
+# Project Rules
+
+# MIDAS-UHGG DB to genotypes
+## Download/extract MIDASDB genotypes
+rule download_midasdb_local:
+    output:
+        "data/species/{species}/genome/{genome_id}/genome.fn",
+    input:
+        db=config["midas_db_dir"] + "/cleaned_imports/{species}/{genome_id}/{genome_id}.fasta",
+    params:
+        out_dir='data/species/{species}/genome/{genome_id}/',
+    shell:
+        """
+        mkdir -p {params.out_dir}
+        cp {input.db} {output}
+        """
+
+rule normalize_genome_sequence:
+    output:
+        "{stem}.norm.fn",
+    input:
+        "{stem}.fn",
+    shell:
+        "sed '/^>/!s/[^ACGT]/N/g' {input} > {output}"
+
+
+# Parse gene genotypes to tables
+### TODO: make sure this works with new midas version
+rule convert_midasdb_species_gene_list_to_reference_genome_table:
+    output:
+        "data/species/{species}/midasdb.gene{centroid}.copy_number.nc",
+    input:
+        script="scripts/convert_gene_info_to_genome_table.py",
+        genes=config["midas_db_dir"] + "/pangenomes/{species}/genes_info.tsv",
+        genomes="meta/genome.tsv",
+    wildcard_constraints: 
+        centroid="\d{1,2}",
+    shell:
+        "{input.script} {input.genes} {input.genomes} centroid_{wildcards.centroid} {output}"
+
+
+# TODO: Change infix; "hit" is too generic...
+rule copy_number_netcdf_to_presence_tsv:
+    output:
+        "data/species/{species}/midasdb.gene{centroid}.hit.tsv",
+    input:
+        script="scripts/convert_copy_number_netcdf_to_hits_tsv.py",
+        data="data/species/{species}/midasdb.gene{centroid}.copy_number.nc",
+    wildcard_constraints:
+        centroid="\d{1,2}",
+    shell:
+        "{input.script} {input.data} {output}"
+
+
+### De-novo SNP Calling using MUMMER4
+# TODO: Make sure that files won't be updated in future runs.
+rule run_mummer_nucmer_for_genome_against_species_reference:
+    output:
+        "data/species/{species}/genome/{qry_genome}/{stem}.nucmer-spref.delta",
+    input:
+        ref=lambda w: "data/species/{species}/genome/{ref_genome}/{stem}.fn".format(
+            ref_genome=config["species_to_reference_genome"][w.species],
+            species=w.species,
+            stem=w.stem,
+        ),
+        query="data/species/{species}/genome/{qry_genome}/{stem}.fn",
+    params:
+        output_prefix="data/species/{species}/genome/{qry_genome}/{stem}.nucmer-spref",
+    shell:
+        """
+        {config[tools][nucmer]} --prefix={params.output_prefix} {input.ref} {input.query}
+        """
+
+rule run_mummer_show_coords:
+    output:
+        "{stem}.coords",
+    input:
+        "{stem}.delta",
+#    group:
+#        "mummer"
+#    conda:
+#        "conda/mummer.yaml"
+    shell:
+        "{config[tools][show-coords]} -rgT {input} > {output}"
+
+
+rule run_mummer_show_snps:
+    output:
+        "{stem}.snps",
+    input:
+        "{stem}.delta",
+#    group:
+#        "mummer"
+#    conda:
+#        "conda/mummer.yaml"
+    shell:
+        """
+        {config[tools][show-snps]} -ClrT {input} > {output}
+        """
+
+# NOTE: Hub-rule: comment out this entire rule to speed up downstream workflow startup.
+rule compile_snps:
+    output:
+        "data/species/{species}/{stem}.nucmer-{ref}.snps_table.tsv.lz4",
+    input:
+        script="scripts/compile_all_mummer_snps_tables.py",
+        snps=lambda w: [
+            f"data/species/{w.species}/genome/{genome}/{w.stem}.nucmer-{w.ref}.snps"
+            for genome in config["species_to_genomes"][w.species]
+        ],
+        coords=lambda w: [
+            f"data/species/{w.species}/genome/{genome}/{w.stem}.nucmer-{w.ref}.coords"
+            for genome in config["species_to_genomes"][w.species]
+        ],
+    params:
+        args=lambda w: [
+            f"{genome}:data/species/{w.species}/genome/{genome}/{w.stem}.nucmer-{w.ref}.snps:data/species/{w.species}/genome/{genome}/{w.stem}.nucmer-{w.ref}.coords"
+            for genome in config["species_to_genomes"][w.species]
+        ],
+        min_mismatch_rate=0.0,
+    shell:
+        "{input.script} {params.min_mismatch_rate} {params.args} | lz4 -zc > {output}"
+
+### filter down SNPs to exclude polygenic and low covered positions (make sure that this is "core SNPs")
+rule process_snps_table:
+    output:
+        "{stem}.snps_table.filt-poly{poly}-cvrg{cvrg}.geno.tsv",
+    input:
+        script="scripts/process_snps_table.py",
+        snps="{stem}.snps_table.tsv.lz4",
+    params:
+        poly=lambda w: int(w.poly) / 100,
+        cvrg=lambda w: int(w.cvrg) / 100,
+    shell:
+        """
+        {input.script} {params.poly} {params.cvrg} {input.snps} > {output}
+        """
+
+
+### SNP-SNP LD decay estimation:
+#rule estimate_ld_distance_decay_on_subsample:
+#    output:
+#        fig="{stem}.geno.linkagedecay-n{nsnps}-seed{seed}.pdf",
+#        stats="{stem}.geno.linkagedecay-n{nsnps}-seed{seed}.tsv",
+#    input:
+#        script="scripts/calculate_ld_decay_on_subsample.py",
+#        geno="{stem}.geno.tsv.lz4",
+#    shell:
+#        "{input.script} {wildcards.nsnps} {wildcards.seed} {input.geno} {output.stats} {output.fig}"
+
+rule estimate_ld_distance_decay:
+    output:
+        fig="{stem}.geno.linkagedecay.pdf",
+        stats="{stem}.geno.linkagedecay.tsv",
+    input:
+        script="scripts/calculate_ld_decay.py",
+        geno="{stem}.geno.tsv",
+    shell:
+        "{input.script} {input.geno} {output.stats} {output.fig}"
+
+### modification to calculate means
+#rule estimate_ld_distance_decay_mean:
+#    output:
+#        #fig="{stem}.geno.linkagedecay_mean.pdf",
+#        stats="{stem}.geno.linkagedecay_mean.tsv",
+#    input:
+#        script="scripts/calculate_ld_decay_mean.py",
+#        geno="{stem}.geno.tsv",
+#    shell:
+#        "{input.script} {input.geno} {output.stats}"
+
+
+#### VD Gene-SNP LD decay estimation
+rule compute_snp_gene_corr:
+    output:
+        #"data/species/{species}/corr_spearman_snp_genes.tsv",
+        "data/species/{species}/corr_cdist_snp_genes.tsv",
+    input:
+        script="scripts/snp_gene_corr.py",
+        snps="data/species/{species}/genome.norm.nucmer-spref.snps_table.filt-poly05-cvrg90.geno.tsv",
+        #genes="data/species/{species}/midasdb.gene80.hit.tsv",
+        genes="data/species/{species}/midasdb.gene80.bin.filt.r10-c90.tsv",
+
+    shell:
+        "{input.script} {input.snps} {input.genes} {output}"
+
+#### VD
+rule estimate_ld_distance_decay_genes:
+    output:
+        stats="data/species/{species}/snp_gene_decay.tsv",
+        coord="data/species/{species}/snp_gene_counts.tsv",
+    input:
+        script="scripts/snp_gene_ld.py",
+        corr="data/species/{species}/corr_cdist_snp_genes.tsv",
+    params:
+        snp_loc_path='data/species/{species}/snp_loc/',
+    shell:
+        "{input.script} {input.corr} {params.snp_loc_path} {output.stats} {output.coord}"
+
+#### VD
+rule estimate_local_decay_genes:
+    output:
+        stats="data/species/{species}/snp_gene_counts_local.tsv",
+    input:
+        script="scripts/snp_gene_local_subset.py",
+        dist="data/species/{species}/snp_gene_counts.tsv",
+        master="data/stats_all_master_recomb_upd.txt",
+    shell:
+        "{input.script} {input.dist} {input.master} {output.stats}"
+
+
+#### VD
+#TODO: modify these such that we don't recalculate distances
+rule estimate_ld_distance_decay_mge:
+    output:
+        stats="data/species/{species}/snp_mge_decay.tsv",
+    input:
+        script="scripts/snp_gene_ld_mge.py",
+        corr="data/species/{species}/corr_cdist_snp_genes.tsv",
+        eggnog="data/centroid_annot/{species}.centroid80.annot.tsv",
+    params:
+        snp_loc_path='data/species/{species}/snp_loc/',
+    shell:
+        "{input.script} {input.corr} {input.eggnog} {params.snp_loc_path} {output.stats}"
+
+#### VD
+#TODO:modify these such that we don't recalculate distances 
+rule estimate_ld_distance_decay_category:
+    output:
+        decays="data/species/{species}/ld_decay_category.tar.gz",
+    input:
+        script="scripts/snp_gene_category.py",
+        corr="data/species/{species}/corr_cdist_snp_genes.tsv",
+        eggnog="data/centroid_annot/{species}.centroid80.annot.tsv",
+        category="data/category_list.txt",
+    params:
+        snp_loc_path='data/species/{species}/snp_loc/',
+        out_dir="data/species/{species}/ld_category/",
+    shell:
+        """
+        mkdir -p {params.out_dir}
+        {input.script} {input.corr} {input.eggnog} {input.category} {params.snp_loc_path} {params.out_dir}
+        tar -czvf {output.decays} {params.out_dir}
+        """
+
+### VD helper rule that creates just a list of genomes per species:
+rule create_genome_list_per_species:
+    output:
+        out_file="data/species/{species}/genome.norm.nucmer-spref.snps_table.filt-poly05-cvrg90.geno.list.tsv",
+    input:
+        snp_file="data/species/{species}/genome.norm.nucmer-spref.snps_table.filt-poly05-cvrg90.geno.tsv",
+    shell:
+        "head -n 1 {input.snp_file} | cut -f3- | tr '\t' '\n' > {output.out_file}"
+
+
+### VD compile files with local gene coords:
+rule grab_genome_coords:
+    output:
+        out_file="data/species/{species}/genomes.tar.gz",
+        local_cluster="data/species/{species}/genes_info.tsv",
+    input:
+        genomes_list="data/species/{species}/genome.norm.nucmer-spref.snps_table.filt-poly05-cvrg90.geno.list.tsv",
+        genomes_folder=config["midas_db_dir"] + "/gene_annotations/{species}",
+        cluster_info=config["midas_db_dir"] + "/pangenomes/{species}/genes_info.tsv",
+    params:
+        out_dir="data/species/{species}/gene_annot/",
+    shell:
+        """ 
+        echo {input.genomes_folder}
+	mkdir -p {params.out_dir}
+        for genome in $(cat {input.genomes_list})
+        do
+        echo $genome
+	cp {input.genomes_folder}/$genome/$genome.genes {params.out_dir}
+        done
+        echo {output.out_file}
+        echo {params.out_dir}
+        tar -czvf {output.out_file} {params.out_dir}
+        cp {input.cluster_info} {output.local_cluster}
+        """
+
+### VD Helper rule to keep only accessory genes for the downstream analysis
+rule filter_accessory_genes:
+    output:
+        out_file="data/species/{species}/midasdb.gene80.bin.filt.r{rare}-c{core}.tsv",
+    input:
+       gene_file="data/species/{species}/midasdb.gene80.hit.tsv",
+       script="scripts/filter_accessory.py",
+    params:
+        rare=lambda w: int(w.rare) / 100,
+        core=lambda w: int(w.core) / 100,
+    shell:
+       """{input.script} {input.gene_file} {params.rare} {params.core} {output.out_file}"""
+
+
+### VD compile files with SNP coords
+rule compile_local_snps:
+    output:
+        snp_loc_path="data/species/{species}/snp_loc.log",
+    input:
+        path="data/species/{species}/",
+        #snp_file="data/species/{species}/midasdb.clean.derep.geno.tsv",
+        gene_file="data/species/{species}/midasdb.gene80.bin.filt.r10-c90.tsv",
+        snp_file="data/species/{species}/genome.norm.nucmer-spref.snps_table.filt-poly05-cvrg90.geno.tsv",
+        cluster_info="data/species/{species}/genes_info.tsv",
+        script="scripts/compile_snp_coords.py",
+    params:
+        snp_loc_path="data/species/{species}/snp_loc/",
+        genes_annot_path="data/species/{species}/gene_annot/",
+    shell:
+        """
+        mkdir -p {params.snp_loc_path}
+        {input.script} {input.path} {params.snp_loc_path} {input.snp_file} {input.gene_file} {input.cluster_info} > {output.snp_loc_path}
+        """
+
+### VD rule to grab functional annotations
+rule grab_eggnog_annot:
+    output:
+        out_file="data/eggnog.full.tar.gz",
+    input:
+        species_list="meta/species_list.txt",
+        annot_folder=config["midas_db_dir"] + "/pangenomes_annotation/02_eggnog/",
+    params:
+        out_dir="data/eggnog_annot_all",
+    shell:
+        """
+        echo {input.annot_folder}
+        for species in $(cat {input.species_list})
+        do
+        echo $species
+        mkdir -p {params.out_dir}
+        cp {input.annot_folder}/$species/$species.emapper.annotations {params.out_dir}/$species.full.annotations.tsv
+        done
+        echo {output.out_file}
+        echo {params.out_dir}
+        tar -czvf {output.out_file} {params.out_dir}
+        """
+
+#### VD retrieve annotations for centroids
+rule grab_centroid_annot:
+    output:
+        out_file="data/centroids_annot.tar.gz",
+    input:
+        species_list="meta/species_list.txt",
+        annot_folder=config["midas_db_dir"] + "/pangenomes/",
+    params:
+        out_dir="data/centroid_annot",
+    shell:
+        """
+        echo {input.annot_folder}
+        mkdir -p {params.out_dir}
+        for species in $(cat {input.species_list})
+        do
+        echo $species
+        cp {input.annot_folder}/$species/annotation/clusters_80_annot.tsv {params.out_dir}/$species.centroid80.annot.tsv
+        done
+        echo {output.out_file}
+        echo {params.out_dir}
+        tar -czvf {output.out_file} {params.out_dir}
+        """
+
+### VD retrieve annotation per individual genome
+rule grab_mge_annot:
+    output:
+        out_file="data/mge.full.tar.gz",
+    input:
+        species_list="meta/species_list.txt",
+        annot_folder=config["midas_db_dir"] + "/pangenomes_annotation/03_processed/",
+    params:
+        out_dir="data/mge_annot_all",
+    shell:
+        """
+        echo {input.annot_folder}
+        for species in $(cat {input.species_list})
+        do
+        echo $species
+        mkdir -p {params.out_dir}/$species/
+        cp -r {input.annot_folder}/$species/genomad_plasmid/ {params.out_dir}/$species/genomad_plasmid
+        cp -r {input.annot_folder}/$species/genomad_virus/ {params.out_dir}/$species/genomad_virus
+        cp -r {input.annot_folder}/$species/mefinder/ {params.out_dir}/$species/mefinder
+        done
+        echo {output.out_file}
+        echo {params.out_dir}
+        tar -czvf {output.out_file} {params.out_dir}
+        """
+
+####aD rule to calculate gene order consistency
+rule estimate_gene_order:
+    output:
+        stats="data/species/{species}/gene_order_agreement.tsv",
+    input:
+        script="scripts/gene_order_est.py",
+        centroids="data/species/{species}/genes_info.tsv",
+        genes="data/species/{species}/midasdb.gene80.hit.tsv",
+    params:
+        annot_path='data/species/{species}/gene_annot/',
+    shell:
+        "{input.script} {input.centroids} {input.genes} {params.annot_path} {output.stats}"
+
+rule estimate_gene_order_acc:
+    output:
+        stats="data/species/{species}/gene_order_agreement_acc.tsv",
+    input:
+        script="scripts/gene_order_est_acc.py",
+        centroids="data/species/{species}/genes_info.tsv",
+        genes="data/species/{species}/midasdb.gene80.hit.tsv",
+    params:
+        annot_path='data/species/{species}/gene_annot/',
+    shell:
+        "{input.script} {input.centroids} {input.genes} {params.annot_path} {output.stats}"
+
+
+# HELPER: Run operation for every genome in a species:
+rule run_for_all_genomes_of_species:
+    output:
+        touch("data/species/{species}/{stem}.ALL_GENOMES.flag"),
+    input:
+        lambda w: [
+            f"data/species/{w.species}/genome/{genome}/{w.stem}"
+            for genome in config["species_to_genomes"][w.species]
+
+        ],
+
+
+localrules:
+    run_for_all_genomes_of_species,
